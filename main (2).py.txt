@@ -1,0 +1,154 @@
+import os
+import io
+import traceback
+from typing import Dict, Optional, Tuple
+
+import requests
+from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+
+# -----------------------------------------------------------------------------#
+# Configurações
+# -----------------------------------------------------------------------------#
+PLACID_API_KEY = os.getenv("PLACID_API_KEY", "").strip()
+PLACID_BASE = "https://api.placid.app/api/rest"
+
+# UUIDs dos templates do Placid (defina no Render como env vars)
+# Reels Modelo 2 - CENTRO
+TPL_REEL_CENTER = os.getenv("PLACID_REEL_CENTER_TEMPLATE", "wsusffzt492wq").strip()
+# Reels Modelo 1 - LADO
+TPL_REEL_SIDE = os.getenv("PLACID_REEL_SIDE_TEMPLATE", "fhymmiu4gzs1l").strip()
+
+app = Flask(__name__)
+
+# -----------------------------------------------------------------------------#
+# Helpers Placid
+# -----------------------------------------------------------------------------#
+def placid_headers_json() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {PLACID_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+def placid_headers() -> Dict[str, str]:
+    # para upload multipart (não definir Content-Type manualmente)
+    return {"Authorization": f"Bearer {PLACID_API_KEY}"}
+
+def upload_asset_to_placid(file_tuple: Tuple[str, io.BytesIO, str]) -> Dict:
+    """Sobe arquivo (vídeo/imagem) para Placid Assets e retorna JSON com a URL."""
+    url = f"{PLACID_BASE}/assets"
+    files = {"file": file_tuple}
+    r = requests.post(url, headers=placid_headers(), files=files, timeout=180)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Falha no upload de asset {r.status_code}: {r.text}")
+    return r.json()
+
+def create_video_with_clips(clips_payload: list) -> Dict:
+    url = f"{PLACID_BASE}/videos"
+    payload = {"clips": clips_payload}
+    r = requests.post(url, headers=placid_headers_json(), json=payload, timeout=180)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Falha ao renderizar vídeo {r.status_code}: {r.text}")
+    return r.json()
+
+# -----------------------------------------------------------------------------#
+# Utils
+# -----------------------------------------------------------------------------#
+def read_upload(field: str) -> Optional[Tuple[str, bytes, str]]:
+    f = request.files.get(field)
+    if not f or f.filename == "":
+        return None
+    return (secure_filename(f.filename), f.read(), f.mimetype or "application/octet-stream")
+
+def bad(msg: str, status: int = 400):
+    return jsonify({"ok": False, "error": msg}), status
+
+# -----------------------------------------------------------------------------#
+# Endpoints
+# -----------------------------------------------------------------------------#
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "placid": bool(PLACID_API_KEY),
+        "center_template": TPL_REEL_CENTER,
+        "side_template": TPL_REEL_SIDE
+    })
+
+@app.route("/generate/reel", methods=["POST"])
+def generate_reel():
+    """
+    Gera um vídeo Reels usando /videos do Placid.
+
+    Aceita:
+      - multipart/form-data:
+          template: center|side
+          title: texto do título
+          video_file: arquivo .mp4 (ou video_url)
+          bg_image_file: imagem (ou bg_image_url)
+      - application/json com os mesmos campos (sem upload de arquivo)
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        template_key = data.get("template") or request.form.get("template")
+        if not template_key:
+            return bad("Campo 'template' é obrigatório (center|side).")
+
+        if template_key == "center":
+            template_uuid = TPL_REEL_CENTER
+        elif template_key == "side":
+            template_uuid = TPL_REEL_SIDE
+        else:
+            return bad("Valor inválido para 'template' (use center|side).")
+
+        if not template_uuid:
+            return bad("Template UUID não configurado.")
+
+        title = data.get("title") or request.form.get("title")
+        video_url = data.get("video_url") or request.form.get("video_url")
+        bg_image_url = data.get("bg_image_url") or request.form.get("bg_image_url")
+
+        # uploads (se vier arquivo, sobe para o Placid Assets)
+        up_video = read_upload("video_file")
+        up_bg = read_upload("bg_image_file")
+
+        if up_video and not video_url:
+            v_name, v_bytes, v_type = up_video
+            asset = upload_asset_to_placid((v_name, io.BytesIO(v_bytes), v_type))
+            video_url = asset.get("url")
+
+        if up_bg and not bg_image_url:
+            b_name, b_bytes, b_type = up_bg
+            asset = upload_asset_to_placid((b_name, io.BytesIO(b_bytes), b_type))
+            bg_image_url = asset.get("url")
+
+        if not video_url:
+            return bad("Envie um vídeo: 'video_url' ou 'video_file'.")
+
+        # Layers dos seus templates (mesmos nomes em ambos):
+        # titulocopy (texto), video (mídia), fotodefundo (imagem)
+        clip_layers: Dict = {}
+        if title:
+            clip_layers["titulocopy"] = {"text": title}
+        if video_url:
+            clip_layers["video"] = {"url": video_url}
+        if bg_image_url:
+            clip_layers["fotodefundo"] = {"url": bg_image_url}
+
+        clips = [{
+            "template_uuid": template_uuid,
+            "layers": clip_layers
+        }]
+
+        result = create_video_with_clips(clips)
+        file_url = result.get("url") or result.get("file_url")
+        return jsonify({"ok": True, "file_url": file_url, "result": result})
+
+    except Exception as e:
+        traceback.print_exc()
+        return bad(f"Erro ao gerar vídeo: {str(e)}", 500)
+
+# -----------------------------------------------------------------------------#
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
